@@ -59,6 +59,4 @@ account.
 ## Security
 
 Never commit `.env`, paste its contents into chat, or put keys in source code.
-Use TiDB's TLS certificate validation. Because the CollegeFootballData key was
-displayed in a shared conversation, revoke it and create a replacement before
-continuing to use the app.
+Use TiDB's TLS certificate validation.

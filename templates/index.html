@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Penn State Game Explorer</title>
+	<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+	<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+</head>
+<body>
+	<header class="site-header">
+		<a class="brand" href="{{ url_for('index') }}">
+			<span class="brand-mark">PS</span>
+			<span>Penn State <strong>Game Explorer</strong></span>
+		</a>
+		<span class="header-note">Nittany Lions · Game analytics</span>
+	</header>
+
+	<main class="page-shell">
+		<section class="intro">
+			<p class="eyebrow">Game-by-game analysis</p>
+			<h1>Every snap tells a story.</h1>
+			<p class="intro-copy">
+				Explore Penn State play-calling and performance by quarter, score
+				situation, down, and side of the ball.
+			</p>
+		</section>
+
+		{% if page_error %}
+			<section class="notice notice-error" role="alert">
+				<h2>Game data is unavailable</h2>
+				<p>{{ page_error }}</p>
+				<p>Check that <code>TIDB_PASSWORD</code> is configured in your Vercel project environment.</p>
+			</section>
+		{% elif not games_available %}
+			<section class="notice">
+				<h2>No game data yet</h2>
+				<p>
+					The TiDB database has no completed Penn State games. Run the
+					local data sync described in the README, then reload this page.
+				</p>
+			</section>
+		{% else %}
+			<section class="panel filters-panel" aria-label="Game filters">
+				<form method="get" action="{{ url_for('index') }}" class="filters">
+					<label>
+						<span>Season</span>
+						<select name="season" onchange="this.form.submit()">
+							{% for season in seasons %}
+								<option value="{{ season }}" {% if season == selected_season %}selected{% endif %}>{{ season }}</option>
+							{% endfor %}
+						</select>
+					</label>
+					<label class="game-filter">
+						<span>Game</span>
+						<select name="game_id" onchange="this.form.submit()">
+							{% for game in game_options %}
+								<option value="{{ game.id }}" {% if game.id == selected_game_id %}selected{% endif %}>{{ game.label }}</option>
+							{% endfor %}
+						</select>
+					</label>
+					<label>
+						<span>Side of the ball</span>
+						<select name="unit" onchange="this.form.submit()">
+							<option value="Penn State offense" {% if unit == "Penn State offense" %}selected{% endif %}>Penn State offense</option>
+							<option value="Penn State defense" {% if unit == "Penn State defense" %}selected{% endif %}>Penn State defense</option>
+						</select>
+					</label>
+					<label>
+						<span>Quarter</span>
+						<select name="quarter" onchange="this.form.submit()">
+							<option value="All quarters" {% if quarter == "All quarters" %}selected{% endif %}>All quarters</option>
+							{% for option in quarter_options %}
+								<option value="{{ option }}" {% if option == quarter %}selected{% endif %}>{{ option }}</option>
+							{% endfor %}
+						</select>
+					</label>
+					<noscript><button class="button" type="submit">Apply filters</button></noscript>
+				</form>
+			</section>
+
+			<section class="game-heading">
+				<div>
+					<p class="eyebrow">{{ selected_game.season }} season · {{ date_label }} · {{ selected_game.location }}</p>
+					<h2>Penn State vs. {{ selected_game.opponent }}</h2>
+				</div>
+				<p class="score">
+					<span>FINAL</span>
+					<strong>{{ selected_game.penn_state_points }} – {{ selected_game.opponent_points }}</strong>
+					<span>{{ selected_game.result }}</span>
+				</p>
+			</section>
+
+			<section class="metrics" aria-label="Selected game statistics">
+				<article class="metric-card"><span>Plays</span><strong>{{ stats.total_plays }}</strong></article>
+				<article class="metric-card"><span>Rush share</span><strong>{{ stats.rush_share }}</strong></article>
+				<article class="metric-card"><span>Avg. yards / play</span><strong>{{ stats.average_yards }}</strong></article>
+				<article class="metric-card"><span>Success rate</span><strong>{{ stats.success_rate }}</strong></article>
+				<article class="metric-card"><span>Avg. play value (PPA)</span><strong>{{ stats.average_ppa }}</strong></article>
+			</section>
+			<p class="method-note">
+				Success is 50% of yards-to-go on first down, 70% on second, and the
+				line to gain on third/fourth. Explosive pass means a 15+ yard gain
+				(not air yards).
+			</p>
+
+			{% if play_rows %}
+				<section class="chart-grid">
+					<article class="panel chart-panel">
+						<div class="section-heading">
+							<div><p class="eyebrow">Play calling</p><h3>Play type by quarter</h3></div>
+						</div>
+						<div class="chart-wrap"><canvas id="playMixChart" aria-label="Play type by quarter"></canvas></div>
+					</article>
+					<article class="panel chart-panel">
+						<div class="section-heading">
+							<div><p class="eyebrow">Production</p><h3>Average yards by quarter</h3></div>
+						</div>
+						<div class="chart-wrap"><canvas id="yardsChart" aria-label="Average yards gained by quarter"></canvas></div>
+					</article>
+				</section>
+
+				<section class="panel data-panel">
+					<div class="section-heading">
+						<div><p class="eyebrow">Game context</p><h3>Performance by score situation</h3></div>
+					</div>
+					{% if state_rows %}
+						<div class="table-scroll">
+							<table>
+								<thead><tr><th>Quarter</th><th>Score before play</th><th>Plays</th><th>Avg. yards</th><th>Success rate</th><th>Avg. play value (PPA)</th></tr></thead>
+								<tbody>
+									{% for row in state_rows %}
+										<tr>
+											<td>{{ row["Quarter"] }}</td><td>{{ row["Penn State score before play"] }}</td><td>{{ row["Plays"] }}</td>
+											<td>{% if row["Average yards"] is not none %}{{ "%.1f"|format(row["Average yards"]) }}{% else %}N/A{% endif %}</td>
+											<td>{% if row["Success rate"] is not none %}{{ "%.1f"|format(row["Success rate"] * 100) }}%{% else %}N/A{% endif %}</td>
+											<td>{% if row["Average play value (PPA)"] is not none %}{{ "%.2f"|format(row["Average play value (PPA)"]) }}{% else %}N/A{% endif %}</td>
+										</tr>
+									{% endfor %}
+								</tbody>
+							</table>
+						</div>
+					{% else %}
+						<p class="empty-note">Score-situation data is not available for this selection.</p>
+					{% endif %}
+				</section>
+
+				<section class="panel data-panel">
+					<div class="section-heading plays-heading">
+						<div><p class="eyebrow">Play-by-play</p><h3>Individual plays</h3></div>
+						<a class="button button-secondary" href="{{ url_for('download_csv', game_id=selected_game_id, unit=unit, quarter=quarter) }}">Download CSV</a>
+					</div>
+					<div class="table-scroll">
+						<table class="plays-table">
+							<thead><tr><th>Qtr</th><th>Score state</th><th>Score</th><th>Down</th><th>To go</th><th>Type</th><th>Yards</th><th>Success</th><th>PPA</th><th>Scoring</th><th>Description</th></tr></thead>
+							<tbody>
+								{% for play in play_rows %}
+									<tr>
+										<td>{{ play.quarter }}</td>
+										<td>{{ play.score_state }}</td>
+										<td>{% if play.penn_state_score_before_play is not none and play.opponent_score_before_play is not none %}{{ play.penn_state_score_before_play }}–{{ play.opponent_score_before_play }}{% else %}—{% endif %}</td>
+										<td>{{ play.down if play.down is not none else "—" }}</td>
+										<td>{{ play.yards_to_go if play.yards_to_go is not none else "—" }}</td>
+										<td>{{ play.play_kind }}</td>
+										<td>{{ play.yards_gained if play.yards_gained is not none else "—" }}</td>
+										<td>{% if play.success is sameas true %}Yes{% elif play.success is sameas false %}No{% else %}—{% endif %}</td>
+										<td>{% if play.play_value_ppa is not none %}{{ "%.2f"|format(play.play_value_ppa) }}{% else %}—{% endif %}</td>
+										<td>{% if play.scoring %}Yes{% else %}No{% endif %}</td>
+										<td class="description-cell">{{ play.play_description or "—" }}</td>
+									</tr>
+								{% endfor %}
+							</tbody>
+						</table>
+					</div>
+				</section>
+			{% else %}
+				<section class="notice">
+					<h2>No plays for this selection</h2>
+					<p>There are no stored {{ unit|lower }} plays for this game. Check that the selected game has been synced.</p>
+				</section>
+			{% endif %}
+
+			<footer class="page-footer">
+				TiDB contains {{ "{:,}".format(games_count) }} completed games across
+				{{ seasons_count }} seasons. Statistics describe the selected stored plays.
+			</footer>
+
+			{% if chart_data %}
+				<script>
+					window.addEventListener("DOMContentLoaded", () => {
+						const chartData = {{ chart_data|tojson }};
+						const commonOptions = {
+							responsive: true,
+							maintainAspectRatio: false,
+							plugins: { legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8 } } },
+							scales: {
+								x: { grid: { display: false }, ticks: { color: "#667085" } },
+								y: { beginAtZero: true, grid: { color: "#edf0f2" }, ticks: { color: "#667085" } }
+							}
+						};
+						new Chart(document.getElementById("playMixChart"), {
+							type: "bar",
+							data: { labels: chartData.labels, datasets: chartData.play_mix },
+							options: { ...commonOptions, scales: { ...commonOptions.scales, x: { ...commonOptions.scales.x, stacked: true }, y: { ...commonOptions.scales.y, stacked: true } } }
+						});
+						new Chart(document.getElementById("yardsChart"), {
+							type: "line",
+							data: { labels: chartData.labels, datasets: chartData.average_yards },
+							options: commonOptions
+						});
+					});
+				</script>
+			{% endif %}
+		{% endif %}
+	</main>
+</body>
+</html>

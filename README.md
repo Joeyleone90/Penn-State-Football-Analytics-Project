@@ -1,40 +1,49 @@
 # Penn State Game Explorer
 
-An interactive Streamlit website for reviewing Penn State games, quarter-by-quarter
+An interactive Flask website for reviewing Penn State games, quarter-by-quarter
 play calling, and offensive/defensive performance. It stores game results and
-play-by-play data in the project's TiDB Cloud database.
+play-by-play data in the project's TiDB Cloud database and can be deployed to
+Vercel.
 
-## Start the website
+## Run locally
 
-1. Install Python 3.10 or newer.
-2. Install the listed packages from a terminal in this folder:
+1. Install Python 3.10 or newer and the project packages:
 
    ```powershell
    python -m pip install -r requirements.txt
    ```
 
-3. Make sure the local `.env` file contains the two secret values:
+2. Set the database password for the website. Locally, the existing `.env` file
+   can contain `database-password=...`; on Vercel, configure
+   `TIDB_PASSWORD` as an environment variable for each deployment environment.
+   Never commit `.env` or put secrets in source code.
 
-   ```text
-   database-password=YOUR_TIDB_PASSWORD
-   api-key=YOUR_COLLEGEFOOTBALLDATA_KEY
-   ```
-
-   Replace the examples with your own values. Do not commit or share `.env`.
-   The app reads it locally and does not display the values.
-
-4. Start the site:
+3. Start the Flask development server:
 
    ```powershell
-   python -m streamlit run main.py
+   python -m flask --app main run --debug
    ```
 
-5. Open the local URL Streamlit prints, usually `http://localhost:8501`.
-6. If the database has no game details yet, expand **Update data from
-   CollegeFootballData** in the sidebar, choose seasons, and click **Sync
-   selected seasons**. The first sync requests up to 16 endpoints per selected
-   season (one game list and up to 15 weekly play lists). Repeated syncs safely
-   update matching game/play IDs rather than adding duplicate rows.
+4. Open `http://127.0.0.1:5000`.
+
+## Deploy to Vercel
+
+Import this repository into Vercel and deploy it. Vercel detects the Flask
+application in `main.py` automatically. Add `TIDB_PASSWORD` under the project's
+Environment Variables, then redeploy. The app uses TiDB's TLS certificate
+validation when it connects.
+
+The website only reads data from TiDB. To refresh the database, run the sync
+locally instead of exposing a public sync action. Add `api-key=...` to the local
+`.env` file (or set `CFBD_API_KEY`) and run, for example:
+
+```powershell
+python -c "from sync_data import sync_seasons; print(sync_seasons(list(range(2021, 2026))))"
+```
+
+Change the season range as needed. The first sync requests up to 16 endpoints
+per selected season (one game list and up to 15 weekly play lists). Repeated
+syncs safely update matching game/play IDs rather than adding duplicate rows.
 
 ## Data and tables
 
@@ -48,13 +57,12 @@ play-by-play data in the project's TiDB Cloud database.
 The existing `penn_state_plays` table is left in place. The website uses the
 new game and full play-by-play tables.
 
-The CFBD play feed supplies yards gained, not air yards; the dashboard's
-15-yard pass-gain measure is only a long-gain proxy. “Success” is defined as
-gaining at least 50% of yards-to-go on first down, 70% on second down, and the
-line to gain on third/fourth down. Score state means the score before the snap.
-These are descriptive comparisons, not proof that the score caused a coaching
-decision. API access and rate limits depend on CollegeFootballData and your
-account.
+The CFBD play feed supplies yards gained, not air yards; the 15-yard pass-gain
+measure is only a long-gain proxy. “Success” is defined as gaining at least 50%
+of yards-to-go on first down, 70% on second down, and the line to gain on
+third/fourth down. Score state means the score before the snap. These are
+descriptive comparisons, not proof that the score caused a coaching decision.
+API access and rate limits depend on CollegeFootballData and your account.
 
 ## Security
 

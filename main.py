@@ -1,149 +1,192 @@
-"""Streamlit site for exploring Penn State football games and play-by-play."""
+"""Flask website for exploring Penn State football games and play-by-play."""
 
+from flask import Flask, Response, abort, render_template, request
 import pandas as pd
-import plotly.express as px
-import streamlit as st
 
 import db
-from sync_data import sync_seasons
 
+
+app = Flask(__name__)
 
 QUARTER_ORDER = ["Q1", "Q2", "Q3", "Q4", "OT1", "OT2", "OT3", "OT4"]
-COLORS = {"Rush": "#1b5e3b", "Pass": "#c99a2e", "Other": "#7f8c8d"}
+PLAY_COLORS = {"Rush": "#1b5e3b", "Pass": "#c99a2e", "Other": "#7f8c8d"}
+PLAY_COLUMNS = [
+	"quarter",
+	"unit",
+	"score_state",
+	"penn_state_score_before_play",
+	"opponent_score_before_play",
+	"down",
+	"yards_to_go",
+	"play_kind",
+	"yards_gained",
+	"success",
+	"play_value_ppa",
+	"scoring",
+	"play_description",
+]
 
 
-def _mean_or_none(values: pd.Series):
+def _mean_or_none(values: pd.Series) -> float | None:
 	values = pd.to_numeric(values, errors="coerce").dropna()
 	return float(values.mean()) if not values.empty else None
 
 
-def _fmt_number(value, digits: int = 1) -> str:
+def _fmt_number(value: float | None, digits: int = 1) -> str:
 	return f"{value:.{digits}f}" if value is not None and pd.notna(value) else "N/A"
 
 
-def _fmt_percent(value) -> str:
+def _fmt_percent(value: float | None) -> str:
 	return f"{value:.1%}" if value is not None and pd.notna(value) else "N/A"
 
 
-def _render_game(plays: pd.DataFrame, game: pd.Series) -> None:
+def _quarter_sort_key(quarter: str) -> tuple[int, str]:
+	try:
+		return QUARTER_ORDER.index(quarter), quarter
+	except ValueError:
+		return len(QUARTER_ORDER), quarter
+
+
+def _chart_data(plays: pd.DataFrame) -> dict:
+	quarters = sorted(plays["quarter"].dropna().unique().tolist(), key=_quarter_sort_key)
+	play_kinds = sorted(plays["play_kind"].dropna().unique().tolist())
+	datasets = []
+	yards_datasets = []
+
+	for play_kind in play_kinds:
+		kind_plays = plays.loc[plays["play_kind"].eq(play_kind)]
+		counts = kind_plays.groupby("quarter", observed=True).size()
+		average_yards = kind_plays.groupby("quarter", observed=True)[
+			"yards_gained"
+		].mean()
+		color = PLAY_COLORS.get(play_kind, PLAY_COLORS["Other"])
+		datasets.append(
+			{
+				"label": play_kind,
+				"data": [int(counts.get(quarter, 0)) for quarter in quarters],
+				"backgroundColor": color,
+			}
+		)
+		yards_datasets.append(
+			{
+				"label": play_kind,
+				"data": [
+					float(average_yards[quarter])
+					if quarter in average_yards and pd.notna(average_yards[quarter])
+					else None
+					for quarter in quarters
+				],
+				"borderColor": color,
+				"backgroundColor": color,
+				"tension": 0.25,
+				"spanGaps": False,
+			}
+		)
+
+	return {
+		"labels": quarters,
+		"play_mix": datasets,
+		"average_yards": yards_datasets,
+	}
+
+
+def _game_label(game: pd.Series) -> str:
+	week = int(game["week"]) if pd.notna(game["week"]) else "?"
+	return (
+		f"Week {week} · {game['opponent']} · {game['result']} "
+		f"({int(game['penn_state_points'])}-{int(game['opponent_points'])})"
+	)
+
+
+@app.get("/")
+def index():
+	try:
+		games = db.load_games()
+	except RuntimeError as error:
+		app.logger.exception("Could not load game data from TiDB")
+		return render_template("index.html", page_error=str(error)), 503
+
+	if games.empty:
+		return render_template("index.html", games_available=False)
+
+	seasons = sorted(games["season"].dropna().astype(int).unique().tolist())
+	requested_season = request.args.get("season", type=int)
+	selected_season = requested_season if requested_season in seasons else seasons[-1]
+	season_games = games.loc[games["season"].eq(selected_season)].copy()
+
+	requested_game_id = request.args.get("game_id", type=int)
+	selected_rows = season_games.loc[season_games["game_id"].eq(requested_game_id)]
+	selected_game = (
+		selected_rows.iloc[0] if not selected_rows.empty else season_games.iloc[0]
+	)
+	selected_game_id = int(selected_game["game_id"])
+	game_options = [
+		{"id": int(row["game_id"]), "label": _game_label(row)}
+		for _, row in season_games.iterrows()
+	]
 	date_label = (
-		pd.to_datetime(game["start_date"]).strftime("%B %d, %Y").replace(" 0", " ")
-		if pd.notna(game["start_date"])
-		else f"Week {int(game['week'])}"
-	)
-	st.header(f"Penn State vs. {game['opponent']}")
-	st.caption(
-		f"{int(game['season'])} · {date_label} · {game['location']} · "
-		f"Final: Penn State {int(game['penn_state_points'])}, "
-		f"{game['opponent']} {int(game['opponent_points'])} · {game['result']}"
+		pd.to_datetime(selected_game["start_date"]).strftime("%B %d, %Y").replace(" 0", " ")
+		if pd.notna(selected_game["start_date"])
+		else f"Week {int(selected_game['week'])}"
+		if pd.notna(selected_game["week"])
+		else "Date unavailable"
 	)
 
-	if plays.empty:
-		st.info("No play-by-play is stored for this game yet. Use **Sync data** in the sidebar.")
-		return
+	unit = request.args.get("unit", "Penn State offense")
+	if unit not in ("Penn State offense", "Penn State defense"):
+		unit = "Penn State offense"
+	quarter = request.args.get("quarter", "All quarters")
 
-	unit = st.selectbox(
-		"Choose the side of the ball",
-		["Penn State offense", "Penn State defense"],
-		help="Offense shows Penn State's plays. Defense shows opposing offensive plays against Penn State.",
-	)
+	try:
+		plays = db.load_game_plays(selected_game_id).reindex(
+			columns=[*PLAY_COLUMNS, "play_id"]
+		)
+	except RuntimeError as error:
+		app.logger.exception("Could not load play-by-play from TiDB")
+		return render_template(
+			"index.html",
+			page_error=str(error),
+			games_available=True,
+		), 503
+
 	unit_plays = plays.loc[plays["unit"].eq(unit)].copy()
-	if unit_plays.empty:
-		st.warning(f"There are no {unit.lower()} plays for this game.")
-		return
-
 	quarter_options = [
-		quarter for quarter in QUARTER_ORDER if quarter in unit_plays["quarter"].unique()
+		value for value in QUARTER_ORDER if value in unit_plays["quarter"].unique()
 	]
 	quarter_options.extend(
 		sorted(
-			quarter
-			for quarter in unit_plays["quarter"].dropna().unique()
-			if quarter not in quarter_options and quarter != "Unknown"
+			value
+			for value in unit_plays["quarter"].dropna().unique()
+			if value not in quarter_options and value != "Unknown"
 		)
 	)
-	quarter = st.selectbox("Quarter", ["All quarters", *quarter_options])
-	if quarter != "All quarters":
-		unit_plays = unit_plays.loc[unit_plays["quarter"].eq(quarter)].copy()
-
-	run_pass = unit_plays.loc[unit_plays["play_kind"].isin(["Rush", "Pass"])].copy()
-	total_plays = len(unit_plays)
-	rush_share = (
-		float(run_pass["play_kind"].eq("Rush").mean()) if not run_pass.empty else None
-	)
-	average_yards = _mean_or_none(unit_plays["yards_gained"])
-	success_rate = _mean_or_none(unit_plays["success"])
-	epa = _mean_or_none(unit_plays["play_value_ppa"])
-	explosive_rate = _mean_or_none(
-		unit_plays.loc[unit_plays["play_kind"].eq("Pass"), "explosive_pass_15_plus"]
+	if quarter not in quarter_options and quarter != "All quarters":
+		quarter = "All quarters"
+	filtered_plays = (
+		unit_plays
+		if quarter == "All quarters"
+		else unit_plays.loc[unit_plays["quarter"].eq(quarter)].copy()
 	)
 
-	first, second, third, fourth, fifth = st.columns(5)
-	first.metric("Plays", f"{total_plays:,}")
-	second.metric("Rush share", _fmt_percent(rush_share))
-	third.metric("Avg. yards/play", _fmt_number(average_yards))
-	fourth.metric("Success rate", _fmt_percent(success_rate))
-	fifth.metric("Avg. play value (PPA)", _fmt_number(epa, 2))
-	st.caption(
-		"Success: 50% of yards-to-go on first down, 70% on second, and the line "
-		"to gain on third/fourth. Explosive pass = 15+ yards gained (not air yards)."
-	)
+	run_pass = filtered_plays.loc[
+		filtered_plays["play_kind"].isin(["Rush", "Pass"])
+	]
+	stats = {
+		"total_plays": f"{len(filtered_plays):,}",
+		"rush_share": _fmt_percent(
+			float(run_pass["play_kind"].eq("Rush").mean())
+			if not run_pass.empty
+			else None
+		),
+		"average_yards": _fmt_number(_mean_or_none(filtered_plays["yards_gained"])),
+		"success_rate": _fmt_percent(_mean_or_none(filtered_plays["success"])),
+		"average_ppa": _fmt_number(
+			_mean_or_none(filtered_plays["play_value_ppa"]), 2
+		),
+	}
 
-	left, right = st.columns(2)
-	with left:
-		st.subheader("Play type by quarter")
-		mix = (
-			unit_plays.groupby(["quarter", "play_kind"], observed=True)
-			.size()
-			.rename("plays")
-			.reset_index()
-		)
-		if mix.empty:
-			st.info("There are no categorized plays to chart.")
-		else:
-			fig = px.bar(
-				mix,
-				x="quarter",
-				y="plays",
-				color="play_kind",
-				barmode="stack",
-				color_discrete_map=COLORS,
-				labels={"quarter": "Quarter", "plays": "Number of plays", "play_kind": "Play type"},
-			)
-			fig.update_layout(height=370, margin={"l": 8, "r": 8, "t": 20, "b": 8})
-			st.plotly_chart(fig, width="stretch")
-
-	with right:
-		st.subheader("Average yards gained by quarter")
-		yards = (
-			unit_plays.groupby(["quarter", "play_kind"], observed=True)
-			.agg(average_yards=("yards_gained", "mean"), plays=("yards_gained", "count"))
-			.reset_index()
-		)
-		if yards.empty:
-			st.info("Yardage is not available for this selection.")
-		else:
-			fig = px.line(
-				yards,
-				x="quarter",
-				y="average_yards",
-				color="play_kind",
-				markers=True,
-				hover_data=["plays"],
-				color_discrete_map=COLORS,
-				labels={
-					"quarter": "Quarter",
-					"average_yards": "Average yards",
-					"play_kind": "Play type",
-					"plays": "Plays with yardage",
-				},
-			)
-			fig.update_layout(height=370, margin={"l": 8, "r": 8, "t": 20, "b": 8})
-			st.plotly_chart(fig, width="stretch")
-
-	st.subheader("Performance by score situation")
 	state_summary = (
-		unit_plays.loc[unit_plays["score_state"].ne("Unknown")]
+		filtered_plays.loc[filtered_plays["score_state"].ne("Unknown")]
 		.groupby(["quarter", "score_state"], observed=True)
 		.agg(
 			plays=("play_id", "count"),
@@ -152,11 +195,7 @@ def _render_game(plays: pd.DataFrame, game: pd.Series) -> None:
 			average_ppa=("play_value_ppa", "mean"),
 		)
 		.reset_index()
-	)
-	if state_summary.empty:
-		st.info("Score-situation data is not available for this game.")
-	else:
-		state_summary = state_summary.rename(
+		.rename(
 			columns={
 				"quarter": "Quarter",
 				"score_state": "Penn State score before play",
@@ -166,125 +205,72 @@ def _render_game(plays: pd.DataFrame, game: pd.Series) -> None:
 				"average_ppa": "Average play value (PPA)",
 			}
 		)
-		st.dataframe(state_summary, hide_index=True, width="stretch")
-
-	with st.expander("Inspect the individual plays"):
-		display_columns = [
-			"quarter",
-			"unit",
-			"score_state",
-			"penn_state_score_before_play",
-			"opponent_score_before_play",
-			"down",
-			"yards_to_go",
-			"play_kind",
-			"yards_gained",
-			"success",
-			"play_value_ppa",
-			"scoring",
-			"play_description",
-		]
-		st.dataframe(
-			unit_plays[display_columns].sort_values(
-				["quarter", "down"], na_position="last"
-			),
-			hide_index=True,
-			width="stretch",
-		)
-		st.download_button(
-			"Download this game's filtered plays",
-			unit_plays[display_columns].to_csv(index=False).encode("utf-8"),
-			file_name=f"penn-state-{int(game['game_id'])}-plays.csv",
-			mime="text/csv",
-		)
-
-
-def main() -> None:
-	st.set_page_config(
-		page_title="Penn State Game Explorer",
-		page_icon="🏈",
-		layout="wide",
 	)
-	st.title("Penn State Game Explorer")
-	st.write(
-		"Explore game-by-game play-calling and performance by quarter, score "
-		"situation, down, and side of the ball."
+	state_rows = (
+		state_summary.astype(object)
+		.where(pd.notna(state_summary), None)
+		.to_dict("records")
+	)
+	play_rows = (
+		filtered_plays[PLAY_COLUMNS]
+		.sort_values(["quarter", "down"], na_position="last")
+		.astype(object)
+		.where(pd.notna(filtered_plays[PLAY_COLUMNS]), None)
+		.to_dict("records")
 	)
 
-	with st.sidebar:
-		st.header("Controls")
-		with st.expander("Update data from CollegeFootballData", expanded=False):
-			st.write(
-				"Sync downloads game results and weekly play-by-play for the "
-				"selected seasons, then updates the TiDB project tables."
-			)
-			season_range = st.select_slider(
-				"Seasons to sync",
-				options=list(range(2015, 2027)),
-				value=(2021, 2025),
-			)
-			if st.button("Sync selected seasons", type="primary", width="stretch"):
-				seasons = list(range(season_range[0], season_range[1] + 1))
-				try:
-					with st.spinner(
-						f"Downloading and saving {season_range[0]}–{season_range[1]}..."
-					):
-						result = sync_seasons(seasons)
-					st.cache_data.clear()
-					st.success(
-						f"Synced {result['games_synced']:,} games and "
-						f"{result['plays_fetched']:,} plays."
-					)
-				except (RuntimeError, ValueError) as error:
-					st.error(str(error))
+	return render_template(
+		"index.html",
+		games_available=True,
+		games_count=len(games),
+		seasons_count=len(seasons),
+		seasons=seasons,
+		selected_season=selected_season,
+		game_options=game_options,
+		selected_game_id=selected_game_id,
+		selected_game=selected_game,
+		date_label=date_label,
+		unit=unit,
+		quarter=quarter,
+		quarter_options=quarter_options,
+		stats=stats,
+		chart_data=_chart_data(filtered_plays) if not filtered_plays.empty else None,
+		state_rows=state_rows,
+		play_rows=play_rows,
+	)
+
+
+@app.get("/download.csv")
+def download_csv():
+	game_id = request.args.get("game_id", type=int)
+	if game_id is None:
+		abort(400, description="Choose a game before downloading plays.")
+
+	unit = request.args.get("unit", "Penn State offense")
+	if unit not in ("Penn State offense", "Penn State defense"):
+		abort(400, description="Choose a valid side of the ball.")
 
 	try:
-		with st.spinner("Loading games from TiDB..."):
-			games = db.load_games()
-	except RuntimeError as error:
-		st.error(str(error))
-		st.info(
-			"Check that the project `.env` file contains the database password, "
-			"then refresh the page. Use the sync panel after the app connects."
+		plays = db.load_game_plays(game_id).reindex(
+			columns=[*PLAY_COLUMNS, "play_id"]
 		)
-		st.stop()
-
-	if games.empty:
-		st.warning("No completed Penn State games are in TiDB yet.")
-		st.info("Open **Update data from CollegeFootballData** in the sidebar and sync seasons.")
-		st.stop()
-
-	seasons = sorted(games["season"].dropna().astype(int).unique().tolist())
-	selected_season = st.sidebar.selectbox(
-		"Season to explore", seasons, index=len(seasons) - 1
-	)
-	season_games = games.loc[games["season"].eq(selected_season)].copy()
-	season_games["display_label"] = season_games.apply(
-		lambda row: (
-			f"Week {int(row['week']) if pd.notna(row['week']) else '?'} · "
-			f"{row['opponent']} · {row['result']} "
-			f"({int(row['penn_state_points'])}-{int(row['opponent_points'])})"
-		),
-		axis=1,
-	)
-	selected_label = st.selectbox("Choose a game", season_games["display_label"].tolist())
-	selected_game = season_games.loc[
-		season_games["display_label"].eq(selected_label)
-	].iloc[0]
-
-	st.caption(
-		f"TiDB contains {len(games):,} completed games across {len(seasons)} "
-		f"seasons. Game details below come from stored play-by-play records."
-	)
-	try:
-		with st.spinner("Loading the selected game's play-by-play..."):
-			plays = db.load_game_plays(int(selected_game["game_id"]))
 	except RuntimeError as error:
-		st.error(str(error))
-		st.stop()
+		app.logger.exception("Could not load plays for CSV download")
+		return str(error), 503
 
-	_render_game(plays, selected_game)
+	plays = plays.loc[plays["unit"].eq(unit)].copy()
+	quarter = request.args.get("quarter", "All quarters")
+	if quarter != "All quarters":
+		plays = plays.loc[plays["quarter"].eq(quarter)]
+	csv_data = plays[PLAY_COLUMNS].to_csv(index=False)
+	return Response(
+		csv_data,
+		mimetype="text/csv",
+		headers={
+			"Content-Disposition": f"attachment; filename=penn-state-{game_id}-plays.csv"
+		},
+	)
 
 
 if __name__ == "__main__":
-	main()
+	app.run(debug=True)
